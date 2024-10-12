@@ -1,0 +1,123 @@
+import os
+import numpy as np
+import tensorflow as tf
+from rdkit import Chem
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+# Chemins des fichiers
+train_sdf = '/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/Train_set_3D.sdf'
+test_sdf = '/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/Test_set_3D.sdf'
+
+def load_molecules_from_sdf(file_path):
+    suppl = Chem.SDMolSupplier(file_path, removeHs=False)
+    molecules = []
+    activities = []
+    max_atoms = 0
+    
+    # First pass: determine the maximum number of atoms
+    for mol in suppl:
+        if mol is not None:
+            max_atoms = max(max_atoms, mol.GetNumAtoms())
+    
+    # Second pass: pad molecules and extract activities
+    suppl = Chem.SDMolSupplier(file_path, removeHs=False)  # Reset supplier
+    for mol in suppl:
+        if mol is not None:
+            conf = mol.GetConformer()
+            positions = conf.GetPositions()
+            num_atoms = positions.shape[0]
+            
+            # Pad with zeros if necessary
+            padded_positions = np.zeros((max_atoms, 3))
+            padded_positions[:num_atoms] = positions
+            
+            molecules.append(padded_positions)
+            
+            activity = mol.GetProp('Activity')
+            activity_value = 1 if activity.lower() == 'active' else 0
+            activities.append(activity_value)
+    
+    return np.array(molecules), np.array(activities)
+
+def pad_molecules(molecules, max_atoms):
+    padded_molecules = []
+    for mol in molecules:
+        if mol.shape[0] < max_atoms:
+            padding = np.zeros((max_atoms - mol.shape[0], 3))
+            padded_mol = np.vstack((mol, padding))
+        else:
+            padded_mol = mol[:max_atoms]
+        padded_molecules.append(padded_mol)
+    return np.array(padded_molecules)
+
+# Charger les données
+train_molecules, train_activities = load_molecules_from_sdf(train_sdf)
+test_molecules, test_activities = load_molecules_from_sdf(test_sdf)
+
+# Trouver le nombre maximum d'atomes
+max_atoms = max(max(mol.shape[0] for mol in train_molecules), 
+                max(mol.shape[0] for mol in test_molecules))
+
+# Padder les molécules
+X_train = pad_molecules(train_molecules, max_atoms)
+X_test = pad_molecules(test_molecules, max_atoms)
+
+# Normaliser les coordonnées
+scaler = StandardScaler()
+X_train_flat = X_train.reshape(X_train.shape[0], -1)
+X_test_flat = X_test.reshape(X_test.shape[0], -1)
+X_train_scaled = scaler.fit_transform(X_train_flat).reshape(X_train.shape)
+X_test_scaled = scaler.transform(X_test_flat).reshape(X_test.shape)
+
+# Diviser les données d'entraînement en ensembles d'entraînement et de validation
+X_train, X_val, y_train, y_val = train_test_split(X_train_scaled, train_activities, test_size=0.2, random_state=42)
+
+# Créer le modèle
+model = tf.keras.Sequential([
+    tf.keras.layers.Input(shape=(max_atoms, 3)),
+    tf.keras.layers.Conv1D(32, 3, activation='relu'),
+    tf.keras.layers.MaxPooling1D(2),
+    tf.keras.layers.Conv1D(64, 3, activation='relu'),
+    tf.keras.layers.MaxPooling1D(2),
+    tf.keras.layers.Flatten(),
+    tf.keras.layers.Dense(64, activation='relu'),
+    tf.keras.layers.Dropout(0.3),
+    tf.keras.layers.Dense(1, activation='sigmoid')
+])
+
+# Compiler le modèle
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# Entraîner le modèle
+history = model.fit(
+    X_train, y_train,
+    epochs=100,
+    batch_size=32,
+    validation_data=(X_val, y_val),
+    callbacks=[tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True)]
+)
+
+# Évaluer le modèle sur l'ensemble de test
+test_loss, test_accuracy = model.evaluate(X_test_scaled, test_activities)
+print(f"Test Accuracy: {test_accuracy:.4f}")
+
+# Faire des prédictions sur l'ensemble de test
+y_pred = model.predict(X_test_scaled)
+y_pred_classes = (y_pred > 0.5).astype(int).flatten()
+
+# Calculer les métriques
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+accuracy = accuracy_score(test_activities, y_pred_classes)
+precision = precision_score(test_activities, y_pred_classes)
+recall = recall_score(test_activities, y_pred_classes)
+f1 = f1_score(test_activities, y_pred_classes)
+
+print(f"Accuracy: {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1 Score: {f1:.4f}")
+
+# Sauvegarder le modèle
+model.save('qsar_3d_coord_model.keras')
+print("Model saved as 'qsar_3d_coord_model.keras'")
