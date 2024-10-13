@@ -1,71 +1,67 @@
 import pandas as pd
-from rdkit import Chem
-from rdkit.Chem import AllChem
+import datamol as dm
 from mordred import Calculator, descriptors
 from tqdm import tqdm
 import concurrent.futures
-import os
 
-# Augmenter la limite de fichiers ouverts
-os.system('ulimit -n 4096')
-
-# Fonction pour générer les conformères et calculer les descripteurs
-def process_smiles(row):
-    smiles, activity, name = row['Smiles'], row['Activity'], row['Molecule Name']
-    mol = Chem.MolFromSmiles(smiles)
+# Fonction pour générer les conformères et calculer les descriptors
+def process_smiles(smiles, name, activity, num_conformers=8):
+    mol = dm.to_mol(smiles)
     if mol is None:
         return None
     
-    mol = Chem.AddHs(mol)
-    AllChem.EmbedMultipleConfs(mol, numConfs=8, randomSeed=42)
+    # Génération des conformères
+    conformers = dm.conformers.generate(mol, n_confs=num_conformers)
     
-    # Optimisation des conformères
-    AllChem.UFFOptimizeMoleculeConfs(mol, maxIters=200)
-    
-    # Calcul des descripteurs
+    # Calcul des descripteurs pour chaque conformère
     calc = Calculator(descriptors, ignore_3D=False)
-    descs = calc.pandas([mol])
     
-    # Ajout de l'activité et du nom de la molécule
-    for conf_id in range(mol.GetNumConformers()):
-        mol.GetConformer(conf_id).SetProp('Activity', activity)
-        mol.GetConformer(conf_id).SetProp('Molecule Name', name)
+    # Exclure ABCIndex des descripteurs
+    calc.descriptors = [d for d in calc.descriptors if d.__class__.__name__ != 'ABCIndex']
     
-    return mol, descs
+    all_descs = []
+    
+    for i in range(conformers.GetNumConformers()):
+        conf = conformers.GetConformer(i)
+        descs = calc(conf.GetOwningMol())
+        desc_dict = {str(d): float(v) if pd.notna(v) else None for d, v in descs.items()}
+        desc_dict['Molecule Name'] = name
+        desc_dict['Activity'] = activity
+        desc_dict['Conformer ID'] = i
+        all_descs.append(desc_dict)
+    
+    return all_descs
 
-# Fonction pour traiter un fichier CSV et générer un fichier SDF
-def process_csv_to_sdf(input_csv, output_sdf):
-    df = pd.read_csv(input_csv)
+# Fonction principale
+def process_csv_to_csv(input_file, output_file):
+    df = pd.read_csv(input_file)
     
-    # Vérification des colonnes nécessaires
-    if not all(col in df.columns for col in ['Smiles', 'Activity', 'Molecule Name']):
-        raise ValueError("Le fichier CSV doit contenir les colonnes 'Smiles', 'Activity' et 'Molecule Name'.")
+    all_descriptors = []
     
-    total_molecules = len(df)
-    
-    with Chem.SDWriter(output_sdf) as writer, \
-         concurrent.futures.ProcessPoolExecutor() as executor:
+    # Utiliser ProcessPoolExecutor pour la parallélisation
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        # Soumettre les tâches
+        futures = [executor.submit(process_smiles, row['Smiles'], row['Molecule Name'], row['Activity']) 
+                   for _, row in df.iterrows()]
         
-        futures = [executor.submit(process_smiles, row) for _, row in df.iterrows()]
-        
-        for future in tqdm(concurrent.futures.as_completed(futures), total=total_molecules, desc="Processing molecules"):
-            try:
-                result = future.result()
-                if result is not None:
-                    mol, descs = result
-                    for conf_id in range(mol.GetNumConformers()):
-                        mol_conf = Chem.Mol(mol, confId=conf_id)
-                        for desc_name, desc_value in descs.iloc[0].items():
-                            if pd.notna(desc_value):
-                                mol_conf.SetProp(desc_name, str(desc_value))
-                        writer.write(mol_conf)
-            except Exception as e:
-                print(f"Error processing molecule: {str(e)}")
+        # Traiter les résultats au fur et à mesure qu'ils sont terminés
+        for future in tqdm(concurrent.futures.as_completed(futures), total=len(df), desc="Processing molecules"):
+            result = future.result()
+            if result:
+                all_descriptors.extend(result)
+    
+    # Création du DataFrame final
+    final_df = pd.DataFrame(all_descriptors)
+    
+    # Réorganisation des colonnes
+    cols = ['Molecule Name', 'Activity', 'Conformer ID'] + [col for col in final_df.columns if col not in ['Molecule Name', 'Activity', 'Conformer ID']]
+    final_df = final_df[cols]
+    
+    # Enregistrement des résultats
+    final_df.to_csv(output_file, index=False)
+    print(f"Descriptors saved to {output_file}")
 
 if __name__ == '__main__':
-    # Traitement du fichier Prion_DB.csv
-    input_file = '/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/Prion_DB.csv'
-    output_file = 'Prion_DB_mordred.sdf'
-    
-    process_csv_to_sdf(input_file, output_file)
-    print("Traitement terminé. Le fichier SDF a été généré avec succès.")
+    input_file = '/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/Prion_DB_clean.csv'
+    output_file = 'descriptors_prion.csv'
+    process_csv_to_csv(input_file, output_file)
