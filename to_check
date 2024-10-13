@@ -4,11 +4,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.layers import Dense, Dropout, Input
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
+from sklearn.metrics import classification_report, confusion_matrix
+from tqdm import tqdm
+import keras_tuner as kt
 
-# Charger les données depuis le fichier Parquet
+# Charger les données
 df = pd.read_parquet('/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/descriptors_prion.parquet')
 
 # Séparer les caractéristiques (X) et les étiquettes (y)
@@ -26,52 +29,80 @@ scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled = scaler.transform(X_test)
 
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Input, Dense, Dropout
+# Calculate class weights
+class_weights = {0: 1., 1: (y_train == 0).sum() / (y_train == 1).sum()}
 
-# Define the input shape
-input_shape = (X_train.shape[1],)
+def build_model(hp):
+    model = Sequential()
+    model.add(Input(shape=(X_train.shape[1],)))
+    
+    for i in range(hp.Int('num_layers', 1, 5)):
+        model.add(Dense(units=hp.Int(f'units_{i}', min_value=32, max_value=512, step=32),
+                        activation='relu'))
+        model.add(Dropout(hp.Float(f'dropout_{i}', 0, 0.5, step=0.1)))
+    
+    model.add(Dense(1, activation='sigmoid'))
+    
+    model.compile(optimizer=Adam(hp.Float('learning_rate', 1e-4, 1e-2, sampling='log')),
+                  loss='binary_crossentropy',
+                  metrics=['accuracy', tf.keras.metrics.AUC(name='auc')])
+    return model
 
-# Create the model
-model = Sequential([
-    Input(shape=input_shape),
-    Dense(128, activation='relu'),
-    Dropout(0.3),
-    Dense(64, activation='relu'),
-    Dropout(0.3),
-    Dense(32, activation='relu'),
-    Dense(1, activation='sigmoid')
-])
+tuner = kt.RandomSearch(
+    build_model,
+    objective=kt.Objective("val_auc", direction="max"),
+    max_trials=50,
+    executions_per_trial=2,
+    directory='tuner_results',
+    project_name='prion_activity'
+)
 
-# Compile the model
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+class TqdmCallback(tf.keras.callbacks.Callback):
+    def on_epoch_begin(self, epoch, logs=None):
+        print(f"Epoch {epoch + 1}/{self.params['epochs']}")
+        self.progbar = tqdm(total=self.params['steps'], unit='batch')
+    
+    def on_batch_end(self, batch, logs=None):
+        self.progbar.update(1)
+    
+    def on_epoch_end(self, epoch, logs=None):
+        self.progbar.close()
 
-# Définir l'early stopping
-early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+stop_early = EarlyStopping(monitor='val_loss', patience=5)
 
-# Entraîner le modèle
-history = model.fit(X_train_scaled, y_train,
-                    epochs=100,
-                    batch_size=32,
-                    validation_split=0.2,
-                    callbacks=[early_stopping],
-                    verbose=1)
+tuner.search(X_train_scaled, y_train,
+             epochs=100,
+             validation_split=0.2,
+             callbacks=[stop_early, TqdmCallback()],
+             class_weight=class_weights,
+             verbose=0)
 
-# Évaluer le modèle
-test_loss, test_accuracy = model.evaluate(X_test_scaled, y_test, verbose=0)
-print(f"Test accuracy: {test_accuracy:.4f}")
+best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
 
-# Faire des prédictions
-y_pred = model.predict(X_test_scaled)
+print("Best Hyperparameters:")
+for param, value in best_hps.values.items():
+    print(f"{param}: {value}")
+
+# Build the model with the best hyperparameters
+best_model = tuner.hypermodel.build(best_hps)
+
+# Train the best model
+history = best_model.fit(X_train_scaled, y_train,
+                         epochs=100,
+                         validation_split=0.2,
+                         callbacks=[EarlyStopping(monitor='val_loss', patience=10), TqdmCallback()],
+                         class_weight=class_weights,
+                         verbose=0)
+
+# Evaluate the model
+y_pred = best_model.predict(X_test_scaled)
 y_pred_classes = (y_pred > 0.5).astype(int)
 
-# Afficher quelques métriques supplémentaires
-from sklearn.metrics import classification_report, confusion_matrix
 print("\nClassification Report:")
 print(classification_report(y_test, y_pred_classes))
 print("\nConfusion Matrix:")
 print(confusion_matrix(y_test, y_pred_classes))
 
-# Sauvegarder le modèle
-model.save('prion_activity_model.keras')
-print("Model saved as 'prion_activity_model.keras'")
+# Save the model
+best_model.save('prion_activity_model_tuned.keras')
+print("Model saved as 'prion_activity_model_tuned.keras'")
