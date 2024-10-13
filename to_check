@@ -12,36 +12,54 @@ from tqdm import tqdm
 import keras_tuner as kt
 
 # Charger les données
-df = pd.read_parquet('/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/descriptors_prion.parquet')
+df = pd.read_parquet('/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/descriptors_prion_cleaned.parquet')
+
+# Afficher les informations sur le DataFrame
+print(df.info())
+
+# Vérifier les valeurs uniques dans la colonne 'Activity'
+print("Valeurs uniques dans 'Activity':", df['Activity'].unique())
 
 # Séparer les caractéristiques (X) et les étiquettes (y)
 X = df.drop(['Molecule Name', 'Activity'], axis=1)
 y = df['Activity']
 
-# Convertir les étiquettes en valeurs numériques
+# Convertir y en valeurs numériques
 y = y.map({'Active': 1, 'Inactive': 0})
 
+# Vérifier les valeurs non finies dans X et y
+print("Valeurs non finies dans X:", X.isna().sum().sum())
+print("Valeurs non finies dans y:", y.isna().sum())
+
+# Remplacer les valeurs non finies par 0 dans X
+X = X.fillna(0)
+
+# Remplacer les valeurs NaN dans y par la classe majoritaire
+y = y.fillna(y.mode()[0])
+
+# Convertir y en array numpy
+y = y.to_numpy()
+
 # Diviser les données en ensembles d'entraînement et de test
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
 
 # Normaliser les caractéristiques
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled = scaler.transform(X_test)
 
-# Calculate class weights
-class_weights = {0: 1., 1: (y_train == 0).sum() / (y_train == 1).sum()}
+# Calculer les poids des classes
+class_weights = {0: 1., 1: np.sum(y_train == 0) / np.sum(y_train == 1)}
 
 def build_model(hp):
-    model = Sequential()
-    model.add(Input(shape=(X_train.shape[1],)))
-    
-    for i in range(hp.Int('num_layers', 1, 5)):
-        model.add(Dense(units=hp.Int(f'units_{i}', min_value=32, max_value=512, step=32),
-                        activation='relu'))
-        model.add(Dropout(hp.Float(f'dropout_{i}', 0, 0.5, step=0.1)))
-    
-    model.add(Dense(1, activation='sigmoid'))
+    model = Sequential([
+        Input(shape=(X_train_scaled.shape[1],)),
+        Dense(units=hp.Int('units_0', min_value=32, max_value=512, step=32), activation='relu'),
+        Dropout(hp.Float('dropout_0', 0, 0.5, step=0.1)),
+        Dense(units=hp.Int('units_1', min_value=32, max_value=256, step=32), activation='relu'),
+        Dropout(hp.Float('dropout_1', 0, 0.5, step=0.1)),
+        Dense(1, activation='sigmoid')
+    ])
     
     model.compile(optimizer=Adam(hp.Float('learning_rate', 1e-4, 1e-2, sampling='log')),
                   loss='binary_crossentropy',
@@ -51,7 +69,7 @@ def build_model(hp):
 tuner = kt.RandomSearch(
     build_model,
     objective=kt.Objective("val_auc", direction="max"),
-    max_trials=50,
+    max_trials=20,
     executions_per_trial=2,
     directory='tuner_results',
     project_name='prion_activity'
@@ -59,7 +77,7 @@ tuner = kt.RandomSearch(
 
 class TqdmCallback(tf.keras.callbacks.Callback):
     def on_epoch_begin(self, epoch, logs=None):
-        print(f"Epoch {epoch + 1}/{self.params['epochs']}")
+        print(f"\nEpoch {epoch + 1}/{self.params['epochs']}")
         self.progbar = tqdm(total=self.params['steps'], unit='batch')
     
     def on_batch_end(self, batch, logs=None):
@@ -70,39 +88,43 @@ class TqdmCallback(tf.keras.callbacks.Callback):
 
 stop_early = EarlyStopping(monitor='val_loss', patience=5)
 
-tuner.search(X_train_scaled, y_train,
-             epochs=100,
-             validation_split=0.2,
-             callbacks=[stop_early, TqdmCallback()],
-             class_weight=class_weights,
-             verbose=0)
+try:
+    tuner.search(X_train_scaled, y_train,
+                 epochs=50,
+                 validation_split=0.2,
+                 callbacks=[stop_early, TqdmCallback()],
+                 class_weight=class_weights,
+                 verbose=0)
 
-best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
+    best_hps = tuner.get_best_hyperparameters(num_trials=1)[0]
 
-print("Best Hyperparameters:")
-for param, value in best_hps.values.items():
-    print(f"{param}: {value}")
+    print("Best Hyperparameters:")
+    for param, value in best_hps.values.items():
+        print(f"{param}: {value}")
 
-# Build the model with the best hyperparameters
-best_model = tuner.hypermodel.build(best_hps)
+    # Construire le meilleur modèle
+    best_model = tuner.hypermodel.build(best_hps)
 
-# Train the best model
-history = best_model.fit(X_train_scaled, y_train,
-                         epochs=100,
-                         validation_split=0.2,
-                         callbacks=[EarlyStopping(monitor='val_loss', patience=10), TqdmCallback()],
-                         class_weight=class_weights,
-                         verbose=0)
+    # Entraîner le meilleur modèle
+    history = best_model.fit(X_train_scaled, y_train,
+                             epochs=100,
+                             validation_split=0.2,
+                             callbacks=[EarlyStopping(monitor='val_loss', patience=10), TqdmCallback()],
+                             class_weight=class_weights,
+                             verbose=0)
 
-# Evaluate the model
-y_pred = best_model.predict(X_test_scaled)
-y_pred_classes = (y_pred > 0.5).astype(int)
+    # Évaluer le modèle
+    y_pred = best_model.predict(X_test_scaled)
+    y_pred_classes = (y_pred > 0.5).astype(int)
 
-print("\nClassification Report:")
-print(classification_report(y_test, y_pred_classes))
-print("\nConfusion Matrix:")
-print(confusion_matrix(y_test, y_pred_classes))
+    print("\nClassification Report:")
+    print(classification_report(y_test, y_pred_classes))
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(y_test, y_pred_classes))
 
-# Save the model
-best_model.save('prion_activity_model_tuned.keras')
-print("Model saved as 'prion_activity_model_tuned.keras'")
+    # Sauvegarder le modèle
+    best_model.save('prion_activity_model_tuned.keras')
+    print("Model saved as 'prion_activity_model_tuned.keras'")
+
+except Exception as e:
+    print(f"An error occurred: {str(e)}")
