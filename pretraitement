@@ -5,49 +5,43 @@ from tqdm import tqdm
 import concurrent.futures
 import pyarrow as pa
 import pyarrow.parquet as pq
+import numpy as np
+import warnings
 
-# Fonction pour générer les conformères et calculer les descripteurs
-def process_smiles(smiles, name, activity, num_conformers=8):
+warnings.filterwarnings("ignore", category=RuntimeWarning, message="underflow encountered in exp")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in reduce")
+
+def safe_calculate(func):
+    try:
+        return func()
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return np.nan
+
+def process_smiles(smiles, name, activity):
     mol = dm.to_mol(smiles)
     if mol is None:
         return None
     
-    # Génération des conformères
-    conformers = dm.conformers.generate(mol, n_confs=num_conformers)
-    
-    # Calcul des descripteurs pour chaque conformère
     calc = Calculator(descriptors, ignore_3D=False)
-    
-    # Exclure ABCIndex des descripteurs
     calc.descriptors = [d for d in calc.descriptors if d.__class__.__name__ != 'ABCIndex']
     
-    all_descs = []
+    descs = calc(mol)
+    desc_dict = {str(d): safe_calculate(lambda x=v: float(x)) for d, v in descs.items()}
+    desc_dict['Molecule Name'] = name
+    desc_dict['Activity'] = activity
     
-    for i in range(conformers.GetNumConformers()):
-        conf = conformers.GetConformer(i)
-        descs = calc(conf.GetOwningMol())
-        desc_dict = {str(d): float(v) if pd.notna(v) else None for d, v in descs.items()}
-        desc_dict['Molecule Name'] = name
-        desc_dict['Activity'] = activity
-        desc_dict['Conformer ID'] = i
-        all_descs.append(desc_dict)
-    
-    return all_descs
+    return desc_dict
 
-# Fonction principale
 def process_csv_to_parquet(input_file, output_file, batch_size=100):
     df = pd.read_csv(input_file)
     
-    # Initialiser le writer Parquet
     schema = None
     writer = None
     
-    # Traiter les molécules par lots
     for i in tqdm(range(0, len(df), batch_size), desc="Processing batches"):
         batch = df.iloc[i:i+batch_size]
         all_descriptors = []
         
-        # Utiliser ProcessPoolExecutor pour la parallélisation
         with concurrent.futures.ProcessPoolExecutor() as executor:
             futures = [executor.submit(process_smiles, row['Smiles'], row['Molecule Name'], row['Activity']) 
                        for _, row in batch.iterrows()]
@@ -55,27 +49,17 @@ def process_csv_to_parquet(input_file, output_file, batch_size=100):
             for future in concurrent.futures.as_completed(futures):
                 result = future.result()
                 if result:
-                    all_descriptors.extend(result)
+                    all_descriptors.append(result)
         
-        # Création du DataFrame pour ce lot
         batch_df = pd.DataFrame(all_descriptors)
         
-        # Réorganisation des colonnes
-        cols = ['Molecule Name', 'Activity', 'Conformer ID'] + [col for col in batch_df.columns if col not in ['Molecule Name', 'Activity', 'Conformer ID']]
-        batch_df = batch_df[cols]
-        
-        # Conversion en table PyArrow
-        table = pa.Table.from_pandas(batch_df)
-        
-        # Si c'est le premier lot, initialiser le writer
         if writer is None:
-            schema = table.schema
+            schema = pa.Schema.from_pandas(batch_df)
             writer = pq.ParquetWriter(output_file, schema, compression='snappy')
         
-        # Écrire le lot dans le fichier Parquet
+        table = pa.Table.from_pandas(batch_df, schema=schema)
         writer.write_table(table)
     
-    # Fermer le writer
     if writer:
         writer.close()
     
