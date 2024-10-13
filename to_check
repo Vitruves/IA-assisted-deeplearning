@@ -1,106 +1,77 @@
+import pandas as pd
 import numpy as np
-import tensorflow as tf
-from rdkit import Chem
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
 
-# Chemins des fichiers
-train_sdf = '/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/Train_set_3D.sdf'
-test_sdf = '/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/Test_set_3D.sdf'
+# Charger les données depuis le fichier Parquet
+df = pd.read_parquet('/Users/johannatter/Documents/Thèse science/Prion/DeepLearning/descriptors_prion.parquet')
 
-def load_molecules_from_sdf(file_path):
-    suppl = Chem.ForwardSDMolSupplier(file_path, removeHs=False, sanitize=False)
-    molecules = []
-    activities = []
-    
-    for mol in suppl:
-        if mol is not None:
-            Chem.AssignStereochemistry(mol, cleanIt=True, force=True)
-            conf = mol.GetConformer()
-            positions = conf.GetPositions()
-            molecules.append(positions)
-            activity = mol.GetProp('Activity')
-            activities.append(1 if activity.lower() == 'active' else 0)
-    
-    return molecules, np.array(activities)
+# Séparer les caractéristiques (X) et les étiquettes (y)
+X = df.drop(['Molecule Name', 'Activity'], axis=1)
+y = df['Activity']
 
-# Charger les données
-print("Chargement des données d'entraînement...")
-train_molecules, train_activities = load_molecules_from_sdf(train_sdf)
-print("Chargement des données de test...")
-test_molecules, test_activities = load_molecules_from_sdf(test_sdf)
+# Convertir les étiquettes en valeurs numériques
+y = y.map({'Active': 1, 'Inactive': 0})
 
-# Trouver le nombre maximum d'atomes parmi tous les ensembles
-max_atoms = max(max(mol.shape[0] for mol in train_molecules), 
-                max(mol.shape[0] for mol in test_molecules))
+# Diviser les données en ensembles d'entraînement et de test
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-# Fonction pour remplir les molécules
-def pad_molecules(molecules, max_atoms):
-    padded_molecules = []
-    for mol in molecules:
-        padded_mol = np.zeros((max_atoms, 3))
-        padded_mol[:mol.shape[0]] = mol
-        padded_molecules.append(padded_mol)
-    return np.array(padded_molecules)
-
-# Remplir les molécules
-X_train = pad_molecules(train_molecules, max_atoms)
-X_test = pad_molecules(test_molecules, max_atoms)
-
-# Normaliser les données
+# Normaliser les caractéristiques
 scaler = StandardScaler()
-X_train_flat = X_train.reshape(X_train.shape[0], -1)
-X_test_flat = X_test.reshape(X_test.shape[0], -1)
-X_train_scaled = scaler.fit_transform(X_train_flat).reshape(X_train.shape)
-X_test_scaled = scaler.transform(X_test_flat).reshape(X_test.shape)
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
 
-model = tf.keras.Sequential([
-    tf.keras.layers.Input(shape=(max_atoms, 3)),
-    tf.keras.layers.Conv1D(32, 3, activation='relu'),
-    tf.keras.layers.MaxPooling1D(2),
-    tf.keras.layers.Conv1D(64, 3, activation='relu'),
-    tf.keras.layers.MaxPooling1D(2),
-    tf.keras.layers.Flatten(),
-    tf.keras.layers.Dense(64, activation='relu'),
-    tf.keras.layers.Dropout(0.3),
-    tf.keras.layers.Dense(1, activation='sigmoid')
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Input, Dense, Dropout
+
+# Define the input shape
+input_shape = (X_train.shape[1],)
+
+# Create the model
+model = Sequential([
+    Input(shape=input_shape),
+    Dense(128, activation='relu'),
+    Dropout(0.3),
+    Dense(64, activation='relu'),
+    Dropout(0.3),
+    Dense(32, activation='relu'),
+    Dense(1, activation='sigmoid')
 ])
 
-# Compiler le modèle
+# Compile the model
 model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
 
+# Définir l'early stopping
+early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+
 # Entraîner le modèle
-print("Entraînement du modèle...")
-history = model.fit(
-    X_train_scaled, train_activities,
-    epochs=50,
-    batch_size=64,
-    validation_split=0.2,
-    callbacks=[tf.keras.callbacks.EarlyStopping(patience=5, restore_best_weights=True)]
-)
+history = model.fit(X_train_scaled, y_train,
+                    epochs=100,
+                    batch_size=32,
+                    validation_split=0.2,
+                    callbacks=[early_stopping],
+                    verbose=1)
 
 # Évaluer le modèle
-print("\nÉvaluation du modèle sur l'ensemble de test...")
-test_loss, test_accuracy = model.evaluate(X_test_scaled, test_activities)
-print(f"Précision sur le test : {test_accuracy:.4f}")
+test_loss, test_accuracy = model.evaluate(X_test_scaled, y_test, verbose=0)
+print(f"Test accuracy: {test_accuracy:.4f}")
 
 # Faire des prédictions
-print("Prédictions sur l'ensemble de test...")
 y_pred = model.predict(X_test_scaled)
-y_pred_classes = (y_pred > 0.5).astype(int).flatten()
+y_pred_classes = (y_pred > 0.5).astype(int)
 
-# Calculer les métriques
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-accuracy = accuracy_score(test_activities, y_pred_classes)
-precision = precision_score(test_activities, y_pred_classes)
-recall = recall_score(test_activities, y_pred_classes)
-f1 = f1_score(test_activities, y_pred_classes)
-
-print(f"Précision : {accuracy:.4f}")
-print(f"Precision : {precision:.4f}")
-print(f"Rappel : {recall:.4f}")
-print(f"Score F1 : {f1:.4f}")
+# Afficher quelques métriques supplémentaires
+from sklearn.metrics import classification_report, confusion_matrix
+print("\nClassification Report:")
+print(classification_report(y_test, y_pred_classes))
+print("\nConfusion Matrix:")
+print(confusion_matrix(y_test, y_pred_classes))
 
 # Sauvegarder le modèle
-model.save('qsar_3d_coord_model.keras')
-print("Modèle sauvegardé sous 'qsar_3d_coord_model.keras'")
+model.save('prion_activity_model.keras')
+print("Model saved as 'prion_activity_model.keras'")
