@@ -1,0 +1,102 @@
+import json
+import asyncio
+from playwright.async_api import async_playwright
+from playwright_stealth import stealth_async
+import aiofiles
+from itertools import cycle
+from tqdm.asyncio import tqdm  # Importing tqdm for the progress bar
+
+# Credentials and URLs
+USERNAME = 'Vitruves'
+PASSWORD = '1234581200'
+BRIGHTDATA_PROXY = 'http://brd-customer-hl_60c85582-zone-scraping_browser1:a4t2y3et9aie@brd.superproxy.io:9222'
+# File Paths
+URL_FILE_PATH = 'DRUGSCOM_url.txt'
+OUTPUT_FILE_PATH = 'DRUGSCOM_reviews.json'
+
+
+# Load URLs from the file
+async def load_urls(filepath):
+    urls = []
+    async with aiofiles.open(filepath, mode='r') as f:
+        async for line in f:
+            urls.append(line.strip())
+    return urls
+
+
+# Extract reviews from a single page
+async def extract_reviews(page, url):
+    await page.goto(url)
+    reviews = []
+
+    # Wait for reviews to load
+    await page.wait_for_selector('div.user-comment', timeout=10000)
+
+    # Scrape reviews
+    review_elements = await page.query_selector_all('div.user-comment')
+    for review_element in review_elements:
+        review = {
+            'username': await review_element.query_selector('span.user').inner_text(),
+            'duration': await review_element.query_selector('span.duration').inner_text(),
+            'date': await review_element.query_selector('span.date').inner_text(),
+            'condition': await review_element.query_selector('span.condition').inner_text(),
+            'comment': await review_element.query_selector('div.comment').inner_text(),
+            'rating': await review_element.query_selector('span.rating').inner_text(),
+            'url': url
+        }
+        reviews.append(review)
+    return reviews
+
+
+# Login function to authenticate on the website
+async def login(page):
+    await page.goto('https://www.drugs.com/account/login/')
+    await page.fill('#email', USERNAME)
+    await page.fill('#password', PASSWORD)
+    await page.click('button[type="submit"]')
+    await page.wait_for_selector('a.logout', timeout=10000)
+
+
+# Scrape a single URL
+async def scrape_url(playwright, proxy, url, progress_bar):
+    # Use Chromium browser with the proxy
+    browser = await playwright.chromium.launch(
+        proxy={"server": proxy},
+        headless=False  # Change to True if you want headless mode
+    )
+    page = await browser.new_page()
+
+    # Stealth to avoid detection
+    await stealth_async(page)
+    await login(page)  # Log in
+
+    # Scrape reviews
+    reviews = await extract_reviews(page, url)
+    await browser.close()
+
+    progress_bar.update(1)  # Update progress bar
+    return reviews
+
+
+# Scrape all URLs using async and proxies
+async def scrape_all_urls():
+    urls = await load_urls(URL_FILE_PATH)
+
+    # Initialize the progress bar
+    async with tqdm(total=len(urls), desc="Scraping progress") as progress_bar:
+        async with async_playwright() as playwright:
+            proxies = cycle([BRIGHTDATA_PROXY])  # If you have multiple proxies, add them to this list
+            tasks = [
+                scrape_url(playwright, next(proxies), url, progress_bar)
+                for url in urls
+            ]
+            results = await asyncio.gather(*tasks)
+
+    # Save reviews to JSON file
+    async with aiofiles.open(OUTPUT_FILE_PATH, 'w') as f:
+        await f.write(json.dumps(results, indent=4))
+
+
+# Main function
+if __name__ == '__main__':
+    asyncio.run(scrape_all_urls())
