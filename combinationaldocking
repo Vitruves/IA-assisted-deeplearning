@@ -1,0 +1,138 @@
+import pandas as pd
+import numpy as np
+from scipy.stats import spearmanr
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from tqdm import tqdm
+import os
+import re
+import threading
+
+# Function to prompt for user inputs
+def get_user_inputs():
+    print("Welcome to the Conformer Combination Analyzer!")
+    while True:
+        file_path = input("Please enter the path to your Excel file (e.g., 'data.xlsx' or \"data (test).xlsx\"): ")
+        file_path = re.sub(r'^["\']|["\']$', '', file_path)
+        if os.path.isfile(file_path):
+            break
+        else:
+            print("File not found. Please try again.")
+
+    while True:
+        try:
+            num_samples = int(input("Enter the number of samples to process (e.g., 100000): "))
+            if num_samples > 0:
+                break
+            else:
+                print("Please enter a positive integer.")
+        except ValueError:
+            print("Invalid input. Please enter an integer.")
+
+    while True:
+        try:
+            num_cores = int(input("Enter the number of CPU cores to use (e.g., 4): "))
+            if num_cores > 0:
+                break
+            else:
+                print("Please enter a positive integer.")
+        except ValueError:
+            print("Invalid input. Please enter an integer.")
+
+    return file_path, num_samples, num_cores
+
+# Function to prompt for columns to analyze, excluding 'Value'
+def get_columns_to_analyze(data):
+    available_columns = [col for col in data.columns if col != "Value"]
+    print("\nAvailable columns for analysis:")
+    print(", ".join(available_columns))
+
+    while True:
+        selected_columns = input("Enter the columns to analyze, separated by commas: ").split(',')
+        selected_columns = [col.strip() for col in selected_columns]
+        if all(col in available_columns for col in selected_columns):
+            return selected_columns
+        else:
+            print("Invalid selection. Please enter valid column names from the list above.")
+
+# Function to sample combinations and calculate the best correlations
+def sample_combinations(num_samples_per_worker, grouped_data, columns_to_correlate):
+    local_best_results = {col: {'R^2': -1, 'combination': None} for col in columns_to_correlate}
+    for _ in range(num_samples_per_worker):
+        selected_indices = []
+        selected_data = {col: [] for col in columns_to_correlate}
+        selected_value = []
+
+        for _, group in grouped_data:
+            conformer = group.sample(1)
+            selected_indices.append(conformer.index[0])
+            selected_value.append(conformer['Value'].values[0])
+            for col in columns_to_correlate:
+                selected_data[col].append(conformer[col].values[0])
+
+        for col in columns_to_correlate:
+            if len(set(selected_data[col])) == 1 or len(set(selected_value)) == 1:
+                continue
+            corr, _ = spearmanr(selected_data[col], selected_value)
+            r2 = corr ** 2
+            if r2 > local_best_results[col]['R^2']:
+                local_best_results[col] = {'R^2': r2, 'combination': sorted(selected_indices)}
+    
+    return local_best_results
+
+# Function to monitor for 'q' input to set the exit flag
+def monitor_exit_flag(exit_flag):
+    print("Press 'q' and Enter to exit early and show the current best results.")
+    while not exit_flag.is_set():
+        if input().strip().lower() == 'q':
+            exit_flag.set()
+            break
+
+# Main function to run the analyzer
+def main():
+    file_path, num_samples, num_workers = get_user_inputs()
+    print(f"\nLoading data from {file_path}...")
+    data = pd.read_excel(file_path)
+    columns_to_correlate = get_columns_to_analyze(data)
+    conformers_by_molecule = data.groupby('Name')
+    num_samples_per_worker = num_samples // num_workers
+
+    overall_best_results = {col: {'R^2': -1, 'combination': None} for col in columns_to_correlate}
+    exit_flag = threading.Event()
+    exit_thread = threading.Thread(target=monitor_exit_flag, args=(exit_flag,))
+    exit_thread.start()
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(sample_combinations, num_samples_per_worker, conformers_by_molecule, columns_to_correlate)
+            for _ in range(num_workers)
+        ]
+
+        with tqdm(total=num_samples, desc="Processing Samples", dynamic_ncols=True) as pbar:
+            for future in as_completed(futures):
+                try:
+                    result = future.result()
+                    pbar.update(num_samples_per_worker)
+
+                    # Update overall best results from worker results
+                    for col, res in result.items():
+                        if res['R^2'] > overall_best_results[col]['R^2']:
+                            overall_best_results[col] = res
+
+                    # Display best R^2 values periodically
+                    best_r2_summary = [f"{col}: {overall_best_results[col]['R^2']:.2f}" for col in columns_to_correlate]
+                    tqdm.write(f"Best R^2 so far: {', '.join(best_r2_summary)}")
+
+                except Exception as e:
+                    print(f"Error in processing: {e}")
+
+    # Display final best combinations
+    print("\nBest Combinations Found:")
+    for col, result in overall_best_results.items():
+        if result['combination'] is not None:
+            best_combination_rows = "+".join([str(index + 1) for index in result['combination']])
+            print(f"{col} - Best Combination: {best_combination_rows}, R^2 = {result['R^2']:.2f}")
+        else:
+            print(f"No valid combination found for {col}.")
+
+if __name__ == '__main__':
+    main()
